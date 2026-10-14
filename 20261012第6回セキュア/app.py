@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import html
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -14,15 +17,52 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 PASSWORD_ITERATIONS = 310_000
 SESSION_LIFETIME = 12 * 60 * 60
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_NOTE_LENGTH = 5_000
+MAX_FILE_BYTES = 1024 * 1024
+MAX_FILES_PER_USER = 100
+MAX_USER_STORAGE_BYTES = 10 * MAX_FILE_BYTES
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+INVALID_FILE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE") == "1"
+FILE_STORAGE_LOCK = threading.RLock()
+
+
+def confined_storage_path(application_root: Path, configured_path: str | Path) -> Path:
+    root = application_root.resolve()
+    configured = Path(configured_path)
+    candidate = Path(os.path.abspath(configured if configured.is_absolute() else root / configured))
+    try:
+        relative_path = candidate.relative_to(root)
+    except ValueError as error:
+        raise ValueError("File storage must be inside the application directory") from error
+    if not relative_path.parts:
+        raise ValueError("File storage must use a dedicated subdirectory")
+
+    current = root
+    for part in relative_path.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("File storage cannot contain symbolic links")
+
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("File storage must resolve inside the application directory") from error
+    if resolved == root:
+        raise ValueError("File storage must use a dedicated subdirectory")
+    return candidate
 
 
 @contextmanager
@@ -106,7 +146,15 @@ def page(title: str, content: str) -> str:
 </html>"""
 
 
-def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    database_path: str,
+    files_directory: str | Path = "user_files",
+    *,
+    application_root: str | Path | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    app_root = Path(application_root or Path(__file__).resolve().parent).resolve()
+    storage_root = confined_storage_path(app_root, files_directory)
+
     class NotesHandler(BaseHTTPRequestHandler):
         server_version = "PersonalNotes"
 
@@ -126,11 +174,20 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self._headers()
             self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(encoded)))
             if cookie:
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _json(self, status: int, payload: dict, cookie: str | None = None) -> None:
+            self._send(
+                status,
+                json.dumps(payload, ensure_ascii=False),
+                "application/json; charset=utf-8",
+                cookie,
+            )
 
         def _cookie_header(self, token: str, max_age: int = SESSION_LIFETIME) -> str:
             secure = "; Secure" if COOKIE_SECURE else ""
@@ -212,9 +269,317 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
                 return None
             return {key: items[0] for key, items in values.items()}
 
+        def _json_form(self) -> tuple[dict | None, int | None]:
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                return None, HTTPStatus.BAD_REQUEST
+            if length < 0:
+                return None, HTTPStatus.BAD_REQUEST
+            if self.headers.get("Transfer-Encoding"):
+                self.close_connection = True
+                return None, HTTPStatus.BAD_REQUEST
+            if length > MAX_FILE_BYTES + 4096:
+                self.close_connection = True
+                return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            try:
+                body = self.rfile.read(length)
+                if self.headers.get_content_type() != "application/json":
+                    return None, HTTPStatus.BAD_REQUEST
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None, HTTPStatus.BAD_REQUEST
+            if not isinstance(payload, dict):
+                return None, HTTPStatus.BAD_REQUEST
+            return payload, None
+
         def _csrf_valid(self, form: dict[str, str], session: dict) -> bool:
             supplied = form.get("csrf_token", "")
             return hmac.compare_digest(supplied, session["csrf_token"])
+
+        def _file_name(self, name: str) -> str | None:
+            try:
+                encoded_name = name.encode("utf-8")
+            except UnicodeEncodeError:
+                return None
+            if (
+                not name
+                or name in {".", ".."}
+                or len(encoded_name) > 255
+                or name.endswith((" ", "."))
+                or INVALID_FILE_NAME.search(name)
+                or Path(name).name != name
+                or name.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+            ):
+                return None
+            return name
+
+        def _user_files_directory(self, user_id: int) -> Path:
+            confined_storage_path(app_root, storage_root)
+            storage_root.mkdir(parents=True, exist_ok=True)
+            user_directory = storage_root / str(user_id)
+            user_directory.mkdir(exist_ok=True)
+            resolved_directory = user_directory.resolve()
+            if user_directory.is_symlink() or resolved_directory.parent != storage_root:
+                raise OSError("User storage directory is outside the configured root")
+            return resolved_directory
+
+        def _file_path(self, user_directory: Path, name: str) -> Path | None:
+            safe_name = self._file_name(name)
+            if safe_name is None:
+                return None
+            path = user_directory / safe_name
+            if path.is_symlink() or path.resolve().parent != user_directory:
+                return None
+            return path
+
+        def _api_error(self, status: int, message: str, cookie: str | None = None) -> None:
+            self._json(status, {"error": message}, cookie)
+
+        def _api_authenticated(self, session: dict, cookie: str | None) -> bool:
+            if session["user_id"]:
+                return True
+            self._api_error(HTTPStatus.UNAUTHORIZED, "ログインが必要です。", cookie)
+            return False
+
+        def _api_csrf_valid(self, session: dict) -> bool:
+            supplied = self.headers.get("X-CSRF-Token", "")
+            if hmac.compare_digest(supplied, session["csrf_token"]):
+                return True
+            self._api_error(HTTPStatus.FORBIDDEN, "CSRFトークンが正しくありません。")
+            return False
+
+        def _api_file_content(self, payload: dict) -> tuple[str, bytes] | None:
+            name = payload.get("name")
+            content = payload.get("content")
+            if not isinstance(name, str) or self._file_name(name) is None:
+                return None
+            if not isinstance(content, str):
+                return None
+            try:
+                encoded_content = content.encode("utf-8")
+            except UnicodeEncodeError:
+                return None
+            if len(encoded_content) > MAX_FILE_BYTES:
+                return None
+            return name, encoded_content
+
+        def _api_storage_available(self, user_directory: Path, content: bytes, replacing: Path | None = None) -> bool:
+            entries = [
+                entry for entry in user_directory.iterdir()
+                if entry.is_file() and not entry.is_symlink()
+            ]
+            file_count = len(entries)
+            used_bytes = sum(entry.stat().st_size for entry in entries)
+            if replacing and replacing.exists():
+                file_count -= 1
+                used_bytes -= replacing.stat().st_size
+            return (
+                file_count < MAX_FILES_PER_USER
+                and used_bytes + len(content) <= MAX_USER_STORAGE_BYTES
+            )
+
+        def _api_list_files(self, session: dict, cookie: str | None) -> None:
+            try:
+                with FILE_STORAGE_LOCK:
+                    user_directory = self._user_files_directory(session["user_id"])
+                    files = [
+                        {"name": entry.name, "size": entry.stat().st_size}
+                        for entry in sorted(user_directory.iterdir(), key=lambda item: item.name)
+                        if entry.is_file() and not entry.is_symlink()
+                    ]
+            except OSError:
+                self._api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ファイル一覧を取得できません。", cookie)
+                return
+            self._json(
+                HTTPStatus.OK,
+                {"files": files, "csrf_token": session["csrf_token"]},
+                cookie,
+            )
+
+        def _api_create_file(self, session: dict, payload: dict, cookie: str | None) -> None:
+            file_data = self._api_file_content(payload)
+            if file_data is None:
+                self._api_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "nameと文字列contentを指定してください（ファイル上限1 MiB）。",
+                    cookie,
+                )
+                return
+            name, content = file_data
+            try:
+                with FILE_STORAGE_LOCK:
+                    user_directory = self._user_files_directory(session["user_id"])
+                    path = self._file_path(user_directory, name)
+                    if path is None:
+                        self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                        return
+                    if path.exists():
+                        self._api_error(HTTPStatus.CONFLICT, "同じ名前のファイルが存在します。", cookie)
+                        return
+                    if not self._api_storage_available(user_directory, content):
+                        self._api_error(HTTPStatus.INSUFFICIENT_STORAGE, "保存容量の上限を超えます。", cookie)
+                        return
+                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, "wb") as file:
+                        file.write(content)
+            except OSError:
+                self._api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ファイルを作成できません。", cookie)
+                return
+            self._json(HTTPStatus.CREATED, {"name": name, "size": len(content)}, cookie)
+
+        def _api_read_file(self, session: dict, name: str, cookie: str | None) -> None:
+            try:
+                with FILE_STORAGE_LOCK:
+                    user_directory = self._user_files_directory(session["user_id"])
+                    path = self._file_path(user_directory, name)
+                    if path is None:
+                        self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                        return
+                    if not path.is_file():
+                        self._api_error(HTTPStatus.NOT_FOUND, "ファイルが見つかりません。", cookie)
+                        return
+                    content = path.read_bytes()
+            except OSError:
+                self._api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ファイルを読み取れません。", cookie)
+                return
+            if len(content) > MAX_FILE_BYTES:
+                self._api_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "ファイルサイズの上限を超えています。", cookie)
+                return
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                self._api_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "UTF-8テキストではありません。", cookie)
+                return
+            self._json(HTTPStatus.OK, {"name": name, "content": text}, cookie)
+
+        def _api_update_file(self, session: dict, name: str, payload: dict, cookie: str | None) -> None:
+            content = payload.get("content")
+            if not isinstance(content, str):
+                self._api_error(HTTPStatus.BAD_REQUEST, "文字列contentを指定してください。", cookie)
+                return
+            try:
+                encoded_content = content.encode("utf-8")
+            except UnicodeEncodeError:
+                self._api_error(HTTPStatus.BAD_REQUEST, "contentをUTF-8に変換できません。", cookie)
+                return
+            if len(encoded_content) > MAX_FILE_BYTES:
+                self._api_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "ファイルサイズの上限は1 MiBです。", cookie)
+                return
+            temporary_path: Path | None = None
+            try:
+                with FILE_STORAGE_LOCK:
+                    user_directory = self._user_files_directory(session["user_id"])
+                    path = self._file_path(user_directory, name)
+                    if path is None:
+                        self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                        return
+                    if not path.is_file():
+                        self._api_error(HTTPStatus.NOT_FOUND, "ファイルが見つかりません。", cookie)
+                        return
+                    if not self._api_storage_available(user_directory, encoded_content, path):
+                        self._api_error(HTTPStatus.INSUFFICIENT_STORAGE, "保存容量の上限を超えます。", cookie)
+                        return
+                    descriptor, temporary_name = tempfile.mkstemp(dir=user_directory, prefix=".upload-")
+                    temporary_path = Path(temporary_name)
+                    with os.fdopen(descriptor, "wb") as file:
+                        file.write(encoded_content)
+                    os.replace(temporary_path, path)
+            except OSError:
+                self._api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ファイルを更新できません。", cookie)
+                return
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            self._json(HTTPStatus.OK, {"name": name, "size": len(encoded_content)}, cookie)
+
+        def _api_delete_file(self, session: dict, name: str, cookie: str | None) -> None:
+            try:
+                with FILE_STORAGE_LOCK:
+                    user_directory = self._user_files_directory(session["user_id"])
+                    path = self._file_path(user_directory, name)
+                    if path is None:
+                        self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                        return
+                    if not path.is_file():
+                        self._api_error(HTTPStatus.NOT_FOUND, "ファイルが見つかりません。", cookie)
+                        return
+                    path.unlink()
+            except OSError:
+                self._api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "ファイルを削除できません。", cookie)
+                return
+            self._json(HTTPStatus.OK, {"deleted": name}, cookie)
+
+        def _dispatch_files_api(self, session: dict, cookie: str | None) -> bool:
+            path = urlsplit(self.path).path
+            if path != "/api/files" and not path.startswith("/api/files/"):
+                return False
+            if not self._api_authenticated(session, cookie):
+                return True
+
+            if path == "/api/files":
+                if self.command == "GET":
+                    self._api_list_files(session, cookie)
+                    return True
+                if self.command != "POST":
+                    self._api_error(HTTPStatus.METHOD_NOT_ALLOWED, "このAPIではGETとPOSTを使用できます。", cookie)
+                    return True
+                payload, error_status = self._json_form()
+                if error_status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+                    self._api_error(error_status, "リクエストサイズの上限を超えています。", cookie)
+                    return True
+                if payload is None:
+                    self._api_error(HTTPStatus.BAD_REQUEST, "正しいJSONリクエストが必要です。", cookie)
+                    return True
+                if not self._api_csrf_valid(session):
+                    return True
+                self._api_create_file(session, payload, cookie)
+                return True
+
+            encoded_name = path.removeprefix("/api/files/")
+            try:
+                name = unquote(encoded_name, errors="strict")
+            except UnicodeDecodeError:
+                self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                return True
+            if not name or "/" in name:
+                self._api_error(HTTPStatus.BAD_REQUEST, "ファイル名が不正です。", cookie)
+                return True
+
+            if self.command == "GET":
+                self._api_read_file(session, name, cookie)
+            elif self.command == "PUT":
+                payload, error_status = self._json_form()
+                if error_status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+                    self._api_error(error_status, "リクエストサイズの上限を超えています。", cookie)
+                    return True
+                if payload is None:
+                    self._api_error(HTTPStatus.BAD_REQUEST, "正しいJSONリクエストが必要です。", cookie)
+                    return True
+                if not self._api_csrf_valid(session):
+                    return True
+                self._api_update_file(session, name, payload, cookie)
+            elif self.command == "DELETE":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self.close_connection = True
+                    self._api_error(HTTPStatus.BAD_REQUEST, "Content-Lengthが不正です。", cookie)
+                    return True
+                if length < 0 or length > MAX_FILE_BYTES + 4096 or self.headers.get("Transfer-Encoding"):
+                    self.close_connection = True
+                    self._api_error(HTTPStatus.BAD_REQUEST, "DELETEリクエストに本文は指定できません。", cookie)
+                    return True
+                if length:
+                    self.rfile.read(length)
+                    self._api_error(HTTPStatus.BAD_REQUEST, "DELETEリクエストに本文は指定できません。", cookie)
+                    return True
+                if not self._api_csrf_valid(session):
+                    return True
+                self._api_delete_file(session, name, cookie)
+            else:
+                self._api_error(HTTPStatus.METHOD_NOT_ALLOWED, "このAPIではGET、PUT、DELETEを使用できます。", cookie)
+            return True
 
         def _auth_form(self, session: dict, mode: str, message: str = "",
                        status: int = HTTPStatus.OK, cookie: str | None = None) -> None:
@@ -277,6 +642,8 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             session, cookie = self._get_session()
+            if self._dispatch_files_api(session, cookie):
+                return
             if self.path == "/":
                 self._redirect("/notes" if session["user_id"] else "/login", cookie)
             elif self.path == "/login":
@@ -385,6 +752,8 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             session, cookie = self._get_session()
+            if self._dispatch_files_api(session, cookie):
+                return
             form = self._form()
             if form is None:
                 self._render(HTTPStatus.BAD_REQUEST, "不正なリクエスト", "<h1>不正なリクエストです。</h1>", cookie)
@@ -407,6 +776,16 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
                     "<h1>ページが見つかりません</h1>", cookie,
                 )
 
+        def do_PUT(self) -> None:
+            session, cookie = self._get_session()
+            if not self._dispatch_files_api(session, cookie):
+                self._api_error(HTTPStatus.NOT_FOUND, "APIが見つかりません。", cookie)
+
+        def do_DELETE(self) -> None:
+            session, cookie = self._get_session()
+            if not self._dispatch_files_api(session, cookie):
+                self._api_error(HTTPStatus.NOT_FOUND, "APIが見つかりません。", cookie)
+
         def _replace_session(self, old_session: dict, user_id: int) -> str:
             with connect_database(database_path) as connection:
                 connection.execute(
@@ -423,10 +802,11 @@ def make_handler(database_path: str) -> type[BaseHTTPRequestHandler]:
 
 def main() -> None:
     database_path = os.environ.get("APP_DB_PATH", "notes.sqlite3")
+    files_directory = os.environ.get("APP_FILES_DIR", "user_files")
     host = os.environ.get("APP_HOST", "127.0.0.1")
     port = int(os.environ.get("APP_PORT", "8000"))
     initialize_database(database_path)
-    server = ThreadingHTTPServer((host, port), make_handler(database_path))
+    server = ThreadingHTTPServer((host, port), make_handler(database_path, files_directory))
     print(f"マイメモを起動しました: http://{host}:{port}")
     try:
         server.serve_forever()
